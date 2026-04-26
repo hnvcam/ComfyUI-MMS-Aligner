@@ -1,0 +1,4 @@
+transformers
+huggingface_hub
+uroman
+lingua-language-detector
