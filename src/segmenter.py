@@ -8,6 +8,7 @@ from .aligner import WordTiming
 
 
 SEGMENTATION_MODES = (
+    "single_word",
     "max_chars",
     "punctuation",
     "newlines",
@@ -24,6 +25,26 @@ class Cue:
     start: float
     end: float
     text: str
+
+
+def bridge_gaps(cues: list[Cue], gap_ms: int) -> list[Cue]:
+    """Extend each cue's end to the next cue's start if the gap is < gap_ms.
+
+    Larger gaps are preserved (real pauses stay visible as silence).
+    """
+    if gap_ms <= 0 or len(cues) < 2:
+        return cues
+    threshold = gap_ms / 1000.0
+    for i in range(len(cues) - 1):
+        gap = cues[i + 1].start - cues[i].end
+        if 0 < gap < threshold:
+            cues[i] = Cue(
+                index=cues[i].index,
+                start=cues[i].start,
+                end=cues[i + 1].start,
+                text=cues[i].text,
+            )
+    return cues
 
 
 def _flush(cues: list[Cue], buf: list[WordTiming]) -> None:
@@ -61,6 +82,13 @@ def segment(
         raise ValueError(f"Unknown segmentation mode: {mode}")
     if not words:
         return []
+
+    if mode == "single_word":
+        return [
+            Cue(index=i + 1, start=w.start, end=w.end, text=w.text.strip())
+            for i, w in enumerate(words)
+            if w.text.strip()
+        ]
 
     use_max = "max_chars" in mode
     use_punct = "punctuation" in mode

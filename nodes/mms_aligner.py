@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from ..src import aligner, lang_detect, languages, model_manager, segmenter, srt_writer
 
 
@@ -89,6 +91,7 @@ class MMSAligner:
                         "default": "max_chars+punctuation+newlines",
                         "tooltip": (
                             "How to split words into SRT subtitle lines:\n"
+                            "- single_word: one word per cue (karaoke-style)\n"
                             "- max_chars: pack greedily up to `max_chars_per_line`\n"
                             "- punctuation: break at . ! ? , ; :\n"
                             "- newlines: break at line breaks in the input text\n"
@@ -124,14 +127,47 @@ class MMSAligner:
                         ),
                     },
                 ),
-                "output_path": (
+                "output_name": (
                     "STRING",
                     {
-                        "default": "",
+                        "default": "subtitles",
                         "tooltip": (
-                            "Optional path to write the .srt file. Leave "
-                            "empty to skip writing to disk; the SRT is "
-                            "always returned as a string output."
+                            "Base file name (no extension) written to ComfyUI's "
+                            "output directory. The `.srt` extension is added "
+                            "automatically. When `split_count` > 1, files are "
+                            "named `<output_name>_<index>.srt`."
+                        ),
+                    },
+                ),
+                "gap_ms": (
+                    "INT",
+                    {
+                        "default": 300,
+                        "min": 0,
+                        "max": 5000,
+                        "tooltip": (
+                            "Bridge small gaps between consecutive cues. If "
+                            "the gap between two cues is smaller than this "
+                            "many milliseconds, the previous cue's end is "
+                            "snapped to the next cue's start (prevents "
+                            "subtitle flicker during fluent speech, "
+                            "especially in `single_word` mode). Larger gaps "
+                            "are preserved as natural pauses. Set to 0 to "
+                            "disable."
+                        ),
+                    },
+                ),
+                "split_count": (
+                    "INT",
+                    {
+                        "default": 1,
+                        "min": 1,
+                        "max": 5,
+                        "tooltip": (
+                            "Number of .srt files to split the output across. "
+                            "1 (default) writes a single file. Higher values "
+                            "divide cues into near-equal chunks named "
+                            "`<output_name>_1.srt`, `<output_name>_2.srt`, ..."
                         ),
                     },
                 ),
@@ -164,10 +200,24 @@ class MMSAligner:
         segmentation_mode: str,
         max_chars_per_line: int,
         remove_punctuation: bool,
-        output_path: str,
+        gap_ms: int,
+        output_name: str,
+        split_count: int,
     ):
         if not text or not text.strip():
             raise ValueError("Input `text` is empty.")
+
+        name = (output_name or "").strip()
+        if not name:
+            raise ValueError("Input `output_name` is empty.")
+        # Strip any user-supplied extension and disallow path separators.
+        name = Path(name).name
+        if name.lower().endswith(".srt"):
+            name = name[:-4]
+        if not name:
+            raise ValueError("Input `output_name` is empty.")
+
+        split_count = max(1, min(5, int(split_count)))
 
         waveform = audio["waveform"]
         sample_rate = int(audio["sample_rate"])
@@ -190,10 +240,21 @@ class MMSAligner:
             max_chars_per_line=max_chars_per_line,
             raw_text=text,
         )
+        cues = segmenter.bridge_gaps(cues, gap_ms)
         srt_text = srt_writer.cues_to_srt(cues, remove_punctuation=remove_punctuation)
 
-        written_path = ""
-        if output_path and output_path.strip():
-            written_path = srt_writer.write_srt(srt_text, output_path.strip())
+        out_dir = srt_writer.comfyui_output_dir()
+        chunks = srt_writer.split_cues(cues, split_count)
+        written: list[str] = []
+        if len(chunks) <= 1:
+            target = out_dir / f"{name}.srt"
+            written.append(srt_writer.write_srt(srt_text, str(target)))
+        else:
+            for i, chunk in enumerate(chunks, start=1):
+                chunk_text = srt_writer.cues_to_srt(
+                    chunk, remove_punctuation=remove_punctuation
+                )
+                target = out_dir / f"{name}_{i}.srt"
+                written.append(srt_writer.write_srt(chunk_text, str(target)))
 
-        return (srt_text, written_path)
+        return (srt_text, "\n".join(written))

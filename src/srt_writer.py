@@ -52,3 +52,36 @@ def write_srt(srt_text: str, output_path: str) -> str:
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(srt_text, encoding="utf-8")
     return str(p)
+
+
+def comfyui_output_dir() -> Path:
+    """Return ComfyUI's output directory, falling back to ./output."""
+    try:
+        import folder_paths  # provided by ComfyUI at runtime
+        return Path(folder_paths.get_output_directory())
+    except Exception:
+        here = Path(__file__).resolve()
+        repo_root = here.parent.parent
+        if repo_root.parent.name == "custom_nodes":
+            return repo_root.parent.parent / "output"
+        return repo_root / "output"
+
+
+def split_cues(cues: list[Cue], split_count: int) -> list[list[Cue]]:
+    """Split cues into `split_count` near-equal chunks, re-indexed per chunk."""
+    if split_count <= 1 or not cues:
+        return [cues]
+    n = len(cues)
+    k = min(split_count, n)
+    base, extra = divmod(n, k)
+    chunks: list[list[Cue]] = []
+    start = 0
+    for i in range(k):
+        size = base + (1 if i < extra else 0)
+        chunk = cues[start:start + size]
+        chunks.append([
+            Cue(index=j + 1, start=c.start, end=c.end, text=c.text)
+            for j, c in enumerate(chunk)
+        ])
+        start += size
+    return chunks
