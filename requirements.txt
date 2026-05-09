@@ -2,3 +2,5 @@ transformers
 huggingface_hub
 uroman
 lingua-language-detector
+# Optional: required only when chunk_with_whisper=True on the MMSAligner node.
+faster-whisper

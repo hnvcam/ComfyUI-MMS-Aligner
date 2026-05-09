@@ -67,7 +67,28 @@ def _load_uroman():
     return ur.Uroman()
 
 
-def _load_model_and_processor(model_path: str, language: str, device: str):
+def resolve_dtype(precision: str) -> torch.dtype:
+    """Map a precision label to a torch.dtype. Raises if fp8 is requested
+    but the runtime doesn't expose it."""
+    p = (precision or "fp32").lower()
+    if p in ("fp32", "float32", "f32"):
+        return torch.float32
+    if p in ("fp16", "float16", "half", "f16"):
+        return torch.float16
+    if p in ("bf16", "bfloat16"):
+        return torch.bfloat16
+    if p in ("fp8", "float8", "f8", "fp8_e4m3"):
+        if hasattr(torch, "float8_e4m3fn"):
+            return torch.float8_e4m3fn
+        raise ValueError(
+            "fp8 requires PyTorch 2.1+ with float8 support. "
+            "Use bf16 or fp16 instead."
+        )
+    raise ValueError(f"Unknown precision: {precision!r}")
+
+
+def _load_model_and_processor(model_path: str, language: str, device: str,
+                              dtype: torch.dtype = torch.float32):
     try:
         from transformers import Wav2Vec2ForCTC, AutoProcessor
     except ImportError as e:
@@ -83,7 +104,15 @@ def _load_model_and_processor(model_path: str, language: str, device: str):
     )
     processor.tokenizer.set_target_lang(language)
     model.load_adapter(language)
-    model = model.to(device).eval()
+    # fp8 weights must be cast after loading; .to(dtype=fp8) on conv/norm
+    # layers will fail on most runtimes, so we cast linears only.
+    if dtype == getattr(torch, "float8_e4m3fn", None):
+        model = model.to(device).eval()
+        for m in model.modules():
+            if isinstance(m, torch.nn.Linear):
+                m.weight.data = m.weight.data.to(dtype)
+    else:
+        model = model.to(device=device, dtype=dtype).eval()
     return model, processor
 
 
@@ -103,6 +132,7 @@ def align(
     romanize: bool,
     model_path: str,
     device: str | None = None,
+    dtype: torch.dtype = torch.float32,
 ) -> list[WordTiming]:
     """Force-align `text` to `waveform`. Returns word-level timings."""
     if not text.strip():
@@ -115,15 +145,21 @@ def align(
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    model, processor = _load_model_and_processor(model_path, language, device)
+    model, processor = _load_model_and_processor(model_path, language, device, dtype=dtype)
     blank_id = model.config.pad_token_id
     if blank_id is None:
         blank_id = 0
 
     audio = _prepare_waveform(waveform, sample_rate).to(device)
+    # Cast audio to the same compute dtype as the model (skip for fp8 where
+    # we keep activations in higher precision and only weights are quantised).
+    fp8 = getattr(torch, "float8_e4m3fn", None)
+    if dtype != torch.float32 and dtype != fp8:
+        audio = audio.to(dtype)
     with torch.inference_mode():
         logits = model(audio).logits  # (1, T, V)
-        log_probs = torch.log_softmax(logits, dim=-1)
+        # forced_align expects float32 log_probs
+        log_probs = torch.log_softmax(logits.float(), dim=-1)
 
     uroman_obj = _load_uroman() if romanize else None
 

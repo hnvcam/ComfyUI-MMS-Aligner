@@ -4,7 +4,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from ..src import aligner, lang_detect, languages, model_manager, segmenter, srt_writer
+from ..src import (
+    aligner,
+    lang_detect,
+    languages,
+    model_manager,
+    segmenter,
+    srt_writer,
+    whisper_chunker,
+)
 
 
 class MMSAligner:
@@ -171,6 +179,66 @@ class MMSAligner:
                         ),
                     },
                 ),
+                "precision": (
+                    ["bf16", "fp16", "fp8", "fp32"],
+                    {
+                        "default": "bf16",
+                        "tooltip": (
+                            "Compute precision for the MMS model:\n"
+                            "- bf16 (default): half the VRAM of fp32, "
+                            "wide dynamic range, accurate on Ampere+ GPUs\n"
+                            "- fp16: half the VRAM of fp32, may underflow "
+                            "on very long audio\n"
+                            "- fp8: experimental — quantizes Linear weights "
+                            "to float8_e4m3fn, requires PyTorch 2.1+\n"
+                            "- fp32: full precision, highest VRAM usage"
+                        ),
+                    },
+                ),
+                "chunk_with_whisper": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": (
+                            "Split long audio into smaller chunks using "
+                            "faster-whisper word-level timestamps to find "
+                            "safe split points. Required if MMS OOMs even "
+                            "at fp16/bf16 (typically audio > 15-20 min on "
+                            "consumer GPUs). Adds a Whisper pass before "
+                            "alignment, then merges chunk SRTs."
+                        ),
+                    },
+                ),
+                "whisper_model_size": (
+                    ["tiny", "base", "small", "medium", "large-v3"],
+                    {
+                        "default": "base",
+                        "tooltip": (
+                            "Faster-whisper model size used for chunk-point "
+                            "detection (only when chunk_with_whisper=True). "
+                            "`base` is usually plenty — we only need rough "
+                            "word timings to find anchor points. Larger "
+                            "models give more reliable matches in noisy or "
+                            "tonal-language audio at the cost of VRAM and "
+                            "speed."
+                        ),
+                    },
+                ),
+                "chunk_max_seconds": (
+                    "INT",
+                    {
+                        "default": 360,
+                        "min": 60,
+                        "max": 1800,
+                        "tooltip": (
+                            "Maximum length per chunk in seconds (only when "
+                            "chunk_with_whisper=True). 360s (6 min) is "
+                            "conservative and fits comfortably on 16 GB "
+                            "GPUs at bf16. Increase if your GPU has more "
+                            "VRAM and you want fewer chunks."
+                        ),
+                    },
+                ),
             },
         }
 
@@ -203,6 +271,10 @@ class MMSAligner:
         gap_ms: int,
         output_name: str,
         split_count: int,
+        precision: str = "bf16",
+        chunk_with_whisper: bool = False,
+        whisper_model_size: str = "base",
+        chunk_max_seconds: int = 360,
     ):
         if not text or not text.strip():
             raise ValueError("Input `text` is empty.")
@@ -224,15 +296,45 @@ class MMSAligner:
 
         iso_lang = self._resolve_language(language, custom_language_code, text)
         model_path = model_manager.ensure_model()
+        dtype = aligner.resolve_dtype(precision)
 
-        words = aligner.align(
-            waveform=waveform,
-            sample_rate=sample_rate,
-            text=text,
-            language=iso_lang,
-            romanize=romanize,
-            model_path=model_path,
-        )
+        if chunk_with_whisper:
+            chunks = whisper_chunker.chunk_audio_and_text(
+                waveform=waveform,
+                sample_rate=sample_rate,
+                raw_text=text,
+                chunk_max_seconds=float(chunk_max_seconds),
+                iso639_3_language=iso_lang,
+                whisper_model_size=whisper_model_size,
+            )
+            words = []
+            for ch in chunks:
+                sub_wav = whisper_chunker.slice_waveform(
+                    waveform, sample_rate, ch.audio_start_sec, ch.audio_end_sec,
+                )
+                sub_words = aligner.align(
+                    waveform=sub_wav,
+                    sample_rate=sample_rate,
+                    text=ch.text,
+                    language=iso_lang,
+                    romanize=romanize,
+                    model_path=model_path,
+                    dtype=dtype,
+                )
+                for w in sub_words:
+                    w.start += ch.audio_start_sec
+                    w.end += ch.audio_start_sec
+                words.extend(sub_words)
+        else:
+            words = aligner.align(
+                waveform=waveform,
+                sample_rate=sample_rate,
+                text=text,
+                language=iso_lang,
+                romanize=romanize,
+                model_path=model_path,
+                dtype=dtype,
+            )
 
         cues = segmenter.segment(
             words=words,
